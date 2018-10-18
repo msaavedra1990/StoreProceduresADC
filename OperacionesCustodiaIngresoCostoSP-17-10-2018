@@ -1,0 +1,246 @@
+USE [ADCAPITAL_TRDEV]
+GO
+/****** Object:  StoredProcedure [dbo].[OperacionesCustodiaIngresoCostoSP]    Script Date: 17-10-2018 17:02:59 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- =============================================
+-- Author:		<Marco Saavedra>
+-- Create date: <17-11-2016>
+-- Modify date: <17-10-2018>
+-- Description:	<Procedimiento de almacenado encargado de retornar las operaciones correspondientes a los ingresos y costos en el periodo
+--				correspondiente a la @FechaDesde y @FechaHasta de acuerdo al @Cliente recibido.>
+-- =============================================
+ALTER PROCEDURE [dbo].[OperacionesCustodiaIngresoCostoSP] 
+	-- Add the parameters for the stored procedure here
+	@FechaDesde DATE, 
+	@FechaHasta DATE,
+	@Cliente NVARCHAR(100) 
+AS
+BEGIN
+	-- SET NOCOUNT ON added to prevent extra result sets from
+	-- interfering with SELECT statements.
+	SET NOCOUNT ON;
+
+    -- Insert statements for procedure here
+	-- Declaramos la tabla a retornar.
+	DECLARE @OperacionesCustodiaIngresoCosto
+	TABLE(
+			IdOperacion NVARCHAR(100) NOT NULL,
+			IdentificadorCustodia NVARCHAR(100) NOT NULL,
+			MontoFinal DECIMAL(18, 6),
+			TipoDeOperacion NVARCHAR(100),
+			Denominacion NVARCHAR(100),
+			FechaDeLiquidacion DATE,
+			TipoDeInstrumento NVARCHAR(100)
+	)
+
+	INSERT INTO @OperacionesCustodiaIngresoCosto
+	SELECT 
+	Operacionc.Id,
+	Custodiac.Identificador_Custodia__c,
+	Operacionc.Monto_Final__c AS MontoFinal,
+	TipoDeOperacionc.Name,
+	Denominacionc.Name,
+	Operacionc.Fecha_de_Liquidacion__c,
+	TipoDeInstrumentoc.Name
+	FROM ADCAPITAL_TRDEV.dbo.Custodia__c AS Custodiac
+	INNER JOIN ADCAPITAL_TRDEV.dbo.Operacion__c AS Operacionc
+	ON Custodiac.Operacion__c = Operacionc.Id
+	INNER JOIN ADCAPITAL_TRDEV.dbo.Denominacion__c AS Denominacionc
+	ON Operacionc.Denominacion__c = Denominacionc.Id
+	INNER JOIN ADCAPITAL_TRDEV.dbo.Instrumento__c AS Instrumentoc
+	ON Operacionc.Instrumento__c = Instrumentoc.Id
+	INNER JOIN ADCAPITAL_TRDEV.dbo.Tipo_de_Instrumento__c AS TipoDeInstrumentoc
+	ON Instrumentoc.Tipo_de_Instrumento__c = TipoDeInstrumentoc.Id
+	INNER JOIN ADCAPITAL_TRDEV.dbo.Tipo_de_Operacion__c AS TipoDeOperacionc
+	ON Operacionc.Tipo_de_Operacion__c = TipoDeOperacionc.Id
+	INNER JOIN ADCAPITAL_TRDEV.dbo.Cuenta__c AS Cuentac
+	ON Operacionc.Cuenta__c = Cuentac.Id
+	INNER JOIN ADCAPITAL_TRDEV.dbo.Sociedad__c AS Sociedadc
+	ON Cuentac.Sociedad__c = Sociedadc.Id
+	INNER JOIN ADCAPITAL_TRDEV.dbo.Cliente__c AS Clientec
+	ON Sociedadc.Cliente__c = Clientec.Id
+	WHERE Operacionc.Fecha_de_Liquidacion__c > @FechaDesde --'30-09-2016' --
+	AND Operacionc.Fecha_de_Liquidacion__c <= @FechaHasta --'31-10-2016' --
+	AND Clientec.Name = @Cliente --'INVERSIONES SG' --
+	AND TipoDeOperacionc.Name IN (SELECT 
+									TipoDeOperacionc.Name
+									FROM ADCAPITAL_TRDEV.dbo.Tipo_de_Operacion__c AS TipoDeOperacionc
+									LEFT JOIN ADCAPITAL_TRDEV.dbo.Variacion_por_Tipo_de_Operacion__c AS VPTO
+									ON TipoDeOperacionc.Id = VPTO.Tipo_de_Operacion__c
+									LEFT JOIN ADCAPITAL_TRDEV.dbo.Variacion__c AS Variacionc
+									ON VPTO.Variacion__c = Variacionc.Id
+									WHERE Variacionc.Estado_Afectado__c IN ('Cuentas por Cobrar', 'Cuentas por Pagar')
+									)
+	GROUP BY Operacionc.Id, Custodiac.Identificador_Custodia__c, Operacionc.Monto_Final__c, 
+			 TipoDeOperacionc.Name, Denominacionc.Name, 
+			 Operacionc.Fecha_de_Liquidacion__c, TipoDeInstrumentoc.Name
+
+	--Tabla que utilizaremos para asignar el monto final prorateado en base a la última cantidad que tenia en custodia antes
+	--de ocurrido ya sea el ingreso o el costo.
+	DECLARE @OperacionesAsociadasMasDeUnaCustodia 
+	TABLE(
+		IdOperacion NVARCHAR(100) NOT NULL,
+		IdentificadorCustodia NVARCHAR(100) NOT NULL,
+		MontoFinal DECIMAL(18, 6),
+		TipoDeOperacion NVARCHAR(100),
+		Denominacion NVARCHAR(100),
+		FechaDeLiquidacion DATE,
+		TipoDeInstrumento NVARCHAR(100)
+	)
+
+	INSERT INTO @OperacionesAsociadasMasDeUnaCustodia
+	SELECT *
+	FROM @OperacionesCustodiaIngresoCosto
+	WHERE IdOperacion IN (SELECT IdOperacion 
+							FROM @OperacionesCustodiaIngresoCosto
+							GROUP BY IdOperacion
+							HAVING COUNT(IdOperacion) > 1)
+    
+	--LOG
+	--SELECT * FROM @OperacionesAsociadasMasDeUnaCustodia
+	
+	--Quitamos las operaciones de la tabla operaciones custodia para posteriormente insertarlas con los montos correctos.
+	DELETE FROM @OperacionesCustodiaIngresoCosto
+	WHERE IdOperacion IN (SELECT IdOperacion FROM @OperacionesAsociadasMasDeUnaCustodia)
+
+	WHILE EXISTS (SELECT * FROM @OperacionesAsociadasMasDeUnaCustodia)
+	BEGIN
+		DECLARE @IdentificadorCustodia NVARCHAR(100) = NULL
+		SET @IdentificadorCustodia = (SELECT TOP 1 IdentificadorCustodia FROM @OperacionesAsociadasMasDeUnaCustodia ORDER BY IdOperacion, IdentificadorCustodia)
+
+		DECLARE @IdOperacion NVARCHAR(100) = NULL
+		SET @IdOperacion = (SELECT TOP 1 IdOperacion FROM @OperacionesAsociadasMasDeUnaCustodia ORDER BY IdOperacion, IdentificadorCustodia)
+
+		DECLARE @MontoFinal DECIMAL(18, 6) = NULL
+		SET @MontoFinal = (SELECT TOP 1 MontoFinal FROM @OperacionesAsociadasMasDeUnaCustodia ORDER BY IdOperacion, IdentificadorCustodia)
+
+		DECLARE @TipoDeOperacion NVARCHAR(100) = NULL
+		SET @TipoDeOperacion = (SELECT TOP 1 TipoDeOperacion FROM @OperacionesAsociadasMasDeUnaCustodia ORDER BY IdOperacion, IdentificadorCustodia)
+
+		DECLARE @Denominacion NVARCHAR(100) = NULL
+		SET @Denominacion = (SELECT TOP 1 Denominacion FROM @OperacionesAsociadasMasDeUnaCustodia ORDER BY IdOperacion, IdentificadorCustodia)
+
+		DECLARE @FechaDeLiquidacion DATE = NULL
+		SET @FechaDeLiquidacion = (SELECT TOP 1 FechaDeLiquidacion FROM @OperacionesAsociadasMasDeUnaCustodia ORDER BY IdOperacion, IdentificadorCustodia)
+
+		DECLARE @TipoDeInstrumento NVARCHAR(100) = NULL
+		SET @TipoDeInstrumento = (SELECT TOP 1 TipoDeInstrumento FROM @OperacionesAsociadasMasDeUnaCustodia ORDER BY IdOperacion, IdentificadorCustodia)
+
+		DECLARE @UltimaCantidadCustodia DECIMAL(18, 6) = NULL
+
+		--Condición puntual que ocurre cuando una operación de venta de acciones afecta a más de una custodia y la venta de acciones es parcial y no total.
+		IF(@TipoDeInstrumento = 'Acciones e Indices')
+		BEGIN
+			DECLARE @UltimoOrdenCalculoCantidadConCantidadMayorACero INT = (SELECT MAX(Orden_Calculo_Cantidad__c)
+																				FROM ADCAPITAL_TRDEV.dbo.Custodia__c
+																				WHERE Identificador_Custodia__c = @IdentificadorCustodia
+																				AND Custodia__c.Operacion__c = @IdOperacion
+																				AND Cantidad__c > 0)
+			SET @UltimaCantidadCustodia = (SELECT Cantidad__c
+											FROM ADCAPITAL_TRDEV.dbo.Custodia__c
+											WHERE Identificador_Custodia__c = @IdentificadorCustodia
+											AND Orden_Calculo_Cantidad__c = @UltimoOrdenCalculoCantidadConCantidadMayorACero)
+			--LOG
+			PRINT 'Ultima Cantidad en Custodia: ' + CAST(@UltimaCantidadCustodia AS VARCHAR)
+
+			IF(@UltimaCantidadCustodia IS NULL) --La última cantidad es cero.
+			BEGIN
+				SET @UltimaCantidadCustodia = (SELECT Cantidad__c
+											FROM ADCAPITAL_TRDEV.dbo.Custodia__c
+											WHERE Identificador_Custodia__c = @IdentificadorCustodia
+											AND Orden_Calculo_Cantidad__c = (SELECT MAX(Orden_Calculo_Cantidad__c)
+																				FROM ADCAPITAL_TRDEV.dbo.Custodia__c
+																				WHERE Identificador_Custodia__c = @IdentificadorCustodia
+																				AND Cantidad__c > 0))
+			--LOG
+			PRINT 'Ultima Cantidad en Custodia Seteada: ' + CAST(@UltimaCantidadCustodia AS VARCHAR)
+			END
+			-- Tiene una última cantidad mayor a cero por ende se debe rescatar como cantidad la diferencia entre las acciones que tenia antes de la venta y le restamos la cantidad con las cuales a quedado despues de la venta.
+			-- de esa forma se obtiene la cantidad por la cual proratear el monto total de la venta.
+			ELSE 
+			BEGIN
+				DECLARE @DiferenciaCantidadPenultimaCustodia DECIMAL(18, 6) = NULL
+				DECLARE @UltimaCantidadCustodiaAntesDeLaVenta DECIMAL(18, 6) = NULL
+
+				SET @UltimaCantidadCustodiaAntesDeLaVenta = (SELECT Cantidad__c
+																FROM ADCAPITAL_TRDEV.dbo.Custodia__c
+																WHERE Identificador_Custodia__c = @IdentificadorCustodia
+																AND Orden_Calculo_Cantidad__c = (SELECT MAX(Orden_Calculo_Cantidad__c)
+																									FROM ADCAPITAL_TRDEV.dbo.Custodia__c
+																									WHERE Identificador_Custodia__c = @IdentificadorCustodia
+																									AND Orden_Calculo_Cantidad__c < @UltimoOrdenCalculoCantidadConCantidadMayorACero
+																									AND Cantidad__c > 0))
+				--Calculamos la diferencia entre la cantidad que quedo en custodia post venta con la cantidad que habia antes de restar los nominales vendidos.
+				SET @DiferenciaCantidadPenultimaCustodia = ABS(@UltimaCantidadCustodiaAntesDeLaVenta - @UltimaCantidadCustodia)
+				SET @UltimaCantidadCustodia = @DiferenciaCantidadPenultimaCustodia
+				--LOG
+				PRINT 'Ultima Cantidad Custodia Antes de la Venta: ' + CAST(@UltimaCantidadCustodiaAntesDeLaVenta AS VARCHAR)
+				PRINT 'Diferencia: ' + CAST(@DiferenciaCantidadPenultimaCustodia AS VARCHAR)
+			END
+		END
+		ELSE
+		BEGIN
+			SET @UltimaCantidadCustodia = (SELECT Cantidad 
+											FROM ADCAPITAL_REPDEV.dbo.CUSTODIA 
+											WHERE IdentificadorCustodia = @IdentificadorCustodia
+											AND Fecha = (SELECT MAX(Fecha)
+															FROM ADCAPITAL_REPDEV.dbo.CUSTODIA
+															WHERE IdentificadorCustodia = @IdentificadorCustodia
+															AND Cantidad > 0))
+		END	
+
+		DECLARE @InstrumentoId NVARCHAR(100) = NULL
+		SET @InstrumentoId = (SELECT TOP 1 I.Id
+								FROM ADCAPITAL_REPDEV.dbo.CUSTODIA AS C
+								INNER JOIN ADCAPITAL_REPDEV.dbo.INSTRUMENTO AS I
+								ON C.InstrumentoId = I.Id
+								WHERE C.IdentificadorCustodia = @IdentificadorCustodia)
+
+		DECLARE @CuentaId NVARCHAR(100) = NULL
+		SET @CuentaId = (SELECT TOP 1 C.Id
+								FROM ADCAPITAL_REPDEV.dbo.CUSTODIA AS CU
+								INNER JOIN ADCAPITAL_REPDEV.dbo.CUENTA AS C
+								ON CU.CuentaId = C.Id
+								WHERE CU.IdentificadorCustodia = @IdentificadorCustodia)
+
+		DECLARE @CantidadTotal DECIMAL(18, 6) = NULL
+		SET @CantidadTotal = (SELECT SUM(Cantidad)
+								FROM ADCAPITAL_REPDEV.dbo.CUSTODIA
+								WHERE InstrumentoId = @InstrumentoId
+								AND CuentaId = @CuentaId
+								AND Fecha = (SELECT MAX(Fecha)
+												FROM ADCAPITAL_REPDEV.dbo.CUSTODIA
+												WHERE InstrumentoId = @InstrumentoId
+												AND CuentaId = @CuentaId
+												AND Cantidad > 0))		
+
+		DECLARE @MontoFinalProrateado DECIMAL(18, 6) = NULL
+
+		IF(@TipoDeInstrumento = 'Acciones e Indices')
+		BEGIN
+			DECLARE @precioOp DECIMAL(18, 6) = NULL
+			SET @precioOp = (SELECT Precio__c FROM ADCAPITAL_TRDEV.dbo.Operacion__c WHERE Id = @IdOperacion)
+
+			SET @MontoFinalProrateado = @UltimaCantidadCustodia * @precioOp
+		END
+		ELSE
+		BEGIN
+			SET @MontoFinalProrateado = (@MontoFinal * @UltimaCantidadCustodia) / @CantidadTotal
+		END
+
+		--PRINT N'Ultima Cantidad: ' + CONVERT(NVARCHAR, @UltimaCantidadCustodia)	+ ' Cantidad Total: ' + CONVERT(NVARCHAR, @CantidadTotal) +
+		--		' Monto Final : ' + CONVERT(NVARCHAR, @MontoFinal) + ' Monto Final Prorateado: ' + CONVERT(NVARCHAR, @MontoFinalProrateado)
+
+		INSERT INTO @OperacionesCustodiaIngresoCosto (IdOperacion, IdentificadorCustodia, MontoFinal, TipoDeOperacion, Denominacion, FechaDeLiquidacion)
+		SELECT @IdOperacion, @IdentificadorCustodia, @MontoFinalProrateado, @TipoDeOperacion, @Denominacion, @FechaDeLiquidacion--, @TipoDeInstrumento
+
+		DELETE FROM @OperacionesAsociadasMasDeUnaCustodia
+		WHERE IdentificadorCustodia = @IdentificadorCustodia
+	END
+
+	SELECT *
+	FROM @OperacionesCustodiaIngresoCosto
+END
